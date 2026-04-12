@@ -108,6 +108,36 @@ def ensure_trend_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def time_split_and_trim(
+    df: pd.DataFrame,
+    date_col: str = "date",
+    train_frac: float = 0.70,
+    max_horizon_days: int = 21,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+    """
+    Split a time-indexed panel into chronological train and test sets,
+    then trim the tail of each split by `max_horizon_days`
+    to avoid label leakage.
+    """
+    out = df.copy()
+    out = out.sort_values(date_col)
+
+    all_dates = np.sort(out[date_col].unique())
+    split_idx = int(len(all_dates) * train_frac)
+    train_end_date = all_dates[split_idx]
+
+    train_df = out[out[date_col] <= train_end_date].copy()
+    test_df = out[out[date_col] > train_end_date].copy()
+
+    train_end_valid = train_df[date_col].max() - pd.Timedelta(days=max_horizon_days)
+    test_end_valid = test_df[date_col].max() - pd.Timedelta(days=max_horizon_days)
+
+    train_df = train_df[train_df[date_col] <= train_end_valid].copy()
+    test_df = test_df[test_df[date_col] <= test_end_valid].copy()
+
+    return train_df, test_df, train_end_date
+
+
 def derive_h2_harm_coefficients(
     dose_summary: pd.DataFrame,
     reference_bucket: str = "on_time_or_early",

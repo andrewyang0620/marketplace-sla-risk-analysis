@@ -408,3 +408,110 @@ def build_assumption_profiles() -> Dict[str, Dict]:
             },
         },
     }
+    
+    
+def build_default_roi_scenarios(
+    default_topk: float = 0.05,
+) -> List[Dict]:
+    """
+    Return the default scenario library for H4.
+    """
+    return [
+        {
+            "scenario_family": "default",
+            "scenario_name": "A_throttle_top_1pct",
+            "description": "Hard throttle the top 1% highest-risk seller-days.",
+            "tiers": [
+                {
+                    "tier_name": "top_1pct_throttle",
+                    "start_frac": 0.00,
+                    "end_frac": 0.01,
+                    "action": "throttle",
+                }
+            ],
+        },
+        {
+            "scenario_family": "default",
+            "scenario_name": f"B_tiered_top_{int(default_topk*100)}pct",
+            "description": "Top 1% intensive support; next band standard support.",
+            "tiers": [
+                {
+                    "tier_name": "top_1pct_intensive",
+                    "start_frac": 0.00,
+                    "end_frac": 0.01,
+                    "action": "intensive_support",
+                },
+                {
+                    "tier_name": f"next_{int((default_topk-0.01)*100)}pct_standard",
+                    "start_frac": 0.01,
+                    "end_frac": default_topk,
+                    "action": "standard_support",
+                },
+            ],
+        },
+        {
+            "scenario_family": "default",
+            "scenario_name": "C_monitor_top_10pct",
+            "description": "Low-touch monitoring / warning for the top 10%.",
+            "tiers": [
+                {
+                    "tier_name": "top_10pct_monitor",
+                    "start_frac": 0.00,
+                    "end_frac": 0.10,
+                    "action": "monitor",
+                }
+            ],
+        },
+    ]
+
+
+def build_k_sensitivity_scenarios(
+    k_values: Sequence[float] = (0.01, 0.03, 0.05, 0.10),
+    intensive_frac: float = 0.01,
+) -> List[Dict]:
+    """
+    Build a K-sensitivity scenario family.
+    """
+    scenarios = []
+
+    for k in k_values:
+        if k <= intensive_frac:
+            tiers = [
+                {
+                    "tier_name": f"top_{int(k*100)}pct_intensive",
+                    "start_frac": 0.00,
+                    "end_frac": k,
+                    "action": "intensive_support",
+                }
+            ]
+            desc = f"Intensive support on top {int(k*100)}% seller-days."
+        else:
+            tiers = [
+                {
+                    "tier_name": f"top_{int(intensive_frac*100)}pct_intensive",
+                    "start_frac": 0.00,
+                    "end_frac": intensive_frac,
+                    "action": "intensive_support",
+                },
+                {
+                    "tier_name": f"next_{int((k-intensive_frac)*100)}pct_standard",
+                    "start_frac": intensive_frac,
+                    "end_frac": k,
+                    "action": "standard_support",
+                },
+            ]
+            desc = (
+                f"Top {int(intensive_frac*100)}% intensive support; "
+                f"next {int((k-intensive_frac)*100)}% standard support."
+            )
+
+        scenarios.append(
+            {
+                "scenario_family": "k_sensitivity",
+                "scenario_name": f"K_tiered_top_{int(k*100)}pct",
+                "description": desc,
+                "tiers": tiers,
+            }
+        )
+
+    return scenarios

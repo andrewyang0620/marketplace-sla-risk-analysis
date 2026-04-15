@@ -230,3 +230,181 @@ def derive_h2_harm_coefficients(
         )
 
     return pd.DataFrame(rows)
+
+
+def compute_no_intervention_baseline(
+    scored_df: pd.DataFrame,
+    future_event_count_col: str,
+    future_event_gmv_col: str,
+    severe_harm_row: Dict,
+    assumption_profiles: Dict[str, Dict],
+    current_gmv_proxy_col: str = "delivered_gmv_14d",
+) -> pd.DataFrame:
+    """
+    Compute the explicit no-intervention baseline for each assumption profile.
+
+    This formalises the benchmark that H4 scenarios are compared against.
+
+    Economic proxy design:
+      - Compensation cost proxy:
+          future severe-event GMV x compensation_rate_on_prevented_gmv
+      - Reputation cost proxy:
+          incremental low ratings x cost_per_incremental_low_rating_proxy_brl
+      - Review-score loss is kept as a non-monetised secondary KPI.
+
+    Parameters
+    ----------
+    scored_df : pd.DataFrame
+        Deployment window with future event columns.
+    future_event_count_col : str
+        Future severe-event count column for the chosen horizon.
+    future_event_gmv_col : str
+        Future severe-event GMV column for the chosen horizon.
+    severe_harm_row : dict
+        Severe-harm coefficients from H2.
+    assumption_profiles : dict
+        Output of `build_assumption_profiles()`.
+    current_gmv_proxy_col : str, default "delivered_gmv_14d"
+        Current-period GMV exposure proxy.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per assumption profile with:
+          - total_future_events
+          - total_future_gmv_brl
+          - incremental_low_ratings_proxy
+          - review_points_lost
+          - compensation_cost_proxy_brl
+          - reputation_cost_proxy_brl
+          - total_harm_proxy_brl
+          - current_gmv_proxy_brl
+    """
+    total_future_events = scored_df[future_event_count_col].sum()
+    total_future_gmv = scored_df[future_event_gmv_col].sum()
+    total_current_gmv_proxy = scored_df[current_gmv_proxy_col].sum()
+
+    incremental_low_ratings_proxy = (
+        total_future_events * severe_harm_row["delta_low_rating"]
+    )
+    review_points_lost = (
+        total_future_events * severe_harm_row["delta_review_loss"]
+    )
+
+    rows = []
+    for profile_name, profile in assumption_profiles.items():
+        compensation_cost_proxy = (
+            total_future_gmv * profile["compensation_rate_on_prevented_gmv"]
+        )
+        reputation_cost_proxy = (
+            incremental_low_ratings_proxy
+            * profile["cost_per_incremental_low_rating_proxy_brl"]
+        )
+        total_harm_proxy = compensation_cost_proxy + reputation_cost_proxy
+
+        rows.append(
+            {
+                "assumption_profile": profile_name,
+                "seller_days": len(scored_df),
+                "unique_sellers": scored_df["seller_id"].nunique() if "seller_id" in scored_df.columns else np.nan,
+                "total_future_events": total_future_events,
+                "total_future_gmv_brl": total_future_gmv,
+                "incremental_low_ratings_proxy": incremental_low_ratings_proxy,
+                "review_points_lost": review_points_lost,
+                "compensation_cost_proxy_brl": compensation_cost_proxy,
+                "reputation_cost_proxy_brl": reputation_cost_proxy,
+                "total_harm_proxy_brl": total_harm_proxy,
+                "current_gmv_proxy_brl": total_current_gmv_proxy,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_assumption_profiles() -> Dict[str, Dict]:
+    """
+    Return conservative / base / aggressive assumption profiles for H4.
+    """
+    return {
+        "conservative": {
+            "compensation_rate_on_prevented_gmv": 0.010,
+            "cost_per_incremental_low_rating_proxy_brl": 6.0,
+            "margin_rate_on_gmv": 0.10,
+            "actions": {
+                "monitor": {
+                    "efficacy": 0.05,
+                    "ops_cost_per_flag": 1.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "standard_support": {
+                    "efficacy": 0.15,
+                    "ops_cost_per_flag": 3.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "intensive_support": {
+                    "efficacy": 0.30,
+                    "ops_cost_per_flag": 7.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "throttle": {
+                    "efficacy": 0.65,
+                    "ops_cost_per_flag": 5.0,
+                    "throttle_loss_rate": 0.25,
+                },
+            },
+        },
+        "base": {
+            "compensation_rate_on_prevented_gmv": 0.020,
+            "cost_per_incremental_low_rating_proxy_brl": 12.0,
+            "margin_rate_on_gmv": 0.20,
+            "actions": {
+                "monitor": {
+                    "efficacy": 0.10,
+                    "ops_cost_per_flag": 1.5,
+                    "throttle_loss_rate": 0.00,
+                },
+                "standard_support": {
+                    "efficacy": 0.25,
+                    "ops_cost_per_flag": 3.5,
+                    "throttle_loss_rate": 0.00,
+                },
+                "intensive_support": {
+                    "efficacy": 0.45,
+                    "ops_cost_per_flag": 8.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "throttle": {
+                    "efficacy": 0.80,
+                    "ops_cost_per_flag": 6.0,
+                    "throttle_loss_rate": 0.20,
+                },
+            },
+        },
+        "aggressive": {
+            "compensation_rate_on_prevented_gmv": 0.040,
+            "cost_per_incremental_low_rating_proxy_brl": 20.0,
+            "margin_rate_on_gmv": 0.30,
+            "actions": {
+                "monitor": {
+                    "efficacy": 0.15,
+                    "ops_cost_per_flag": 2.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "standard_support": {
+                    "efficacy": 0.35,
+                    "ops_cost_per_flag": 4.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "intensive_support": {
+                    "efficacy": 0.60,
+                    "ops_cost_per_flag": 9.0,
+                    "throttle_loss_rate": 0.00,
+                },
+                "throttle": {
+                    "efficacy": 0.90,
+                    "ops_cost_per_flag": 7.0,
+                    "throttle_loss_rate": 0.15,
+                },
+            },
+        },
+    }

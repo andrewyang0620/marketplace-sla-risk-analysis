@@ -515,3 +515,240 @@ def build_k_sensitivity_scenarios(
         )
 
     return scenarios
+
+
+def _slice_rank_band(
+    scored_df: pd.DataFrame,
+    score_col: str,
+    start_frac: float,
+    end_frac: float,
+) -> pd.DataFrame:
+    """
+    Slice a ranked score table into a non-overlapping top-K band.
+    """
+    sort_cols = [score_col]
+    ascending = [False]
+
+    for col in ["date", "seller_id"]:
+        if col in scored_df.columns:
+            sort_cols.append(col)
+            ascending.append(True)
+
+    ranked = scored_df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    n = len(ranked)
+    start_idx = int(np.floor(n * start_frac))
+    end_idx = int(np.floor(n * end_frac))
+    if end_frac > start_frac:
+        end_idx = max(end_idx, start_idx + 1)
+
+    return ranked.iloc[start_idx:end_idx].copy()
+
+
+def simulate_ranked_scenario(
+    scored_df: pd.DataFrame,
+    score_col: str,
+    future_event_count_col: str,
+    future_event_gmv_col: str,
+    current_gmv_proxy_col: str,
+    severe_harm_row: Dict,
+    baseline_row: Dict,
+    assumption_profile_name: str,
+    assumption_profile: Dict,
+    scenario_def: Dict,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Simulate one ROI scenario under one assumption profile.
+    """
+    required_cols = [
+        score_col,
+        future_event_count_col,
+        future_event_gmv_col,
+        current_gmv_proxy_col,
+    ]
+    missing = [c for c in required_cols if c not in scored_df.columns]
+    if missing:
+        raise ValueError(f"scored_df is missing required columns: {missing}")
+
+    total_rows = len(scored_df)
+    total_unique_sellers = (
+        scored_df["seller_id"].nunique() if "seller_id" in scored_df.columns else np.nan
+    )
+    total_future_events = scored_df[future_event_count_col].sum()
+    total_future_gmv = scored_df[future_event_gmv_col].sum()
+    total_current_gmv_proxy = scored_df[current_gmv_proxy_col].sum()
+
+    tier_rows = []
+    flagged_parts = []
+
+    for tier in scenario_def["tiers"]:
+        band = _slice_rank_band(
+            scored_df=scored_df,
+            score_col=score_col,
+            start_frac=tier["start_frac"],
+            end_frac=tier["end_frac"],
+        )
+        flagged_parts.append(band)
+
+        action_name = tier["action"]
+        action_params = assumption_profile["actions"][action_name]
+
+        efficacy = action_params["efficacy"]
+        ops_cost_per_flag = action_params["ops_cost_per_flag"]
+        throttle_loss_rate = action_params["throttle_loss_rate"]
+
+        flagged_rows = len(band)
+        unique_flagged_sellers = (
+            band["seller_id"].nunique() if "seller_id" in band.columns else np.nan
+        )
+
+        captured_future_events = band[future_event_count_col].sum()
+        captured_future_gmv = band[future_event_gmv_col].sum()
+        current_gmv_proxy = band[current_gmv_proxy_col].sum()
+
+        prevented_future_events = efficacy * captured_future_events
+        prevented_future_gmv = efficacy * captured_future_gmv
+
+        avoided_incremental_low_ratings = (
+            prevented_future_events * severe_harm_row["delta_low_rating"]
+        )
+        avoided_review_points = (
+            prevented_future_events * severe_harm_row["delta_review_loss"]
+        )
+
+        avoided_compensation_cost = (
+            prevented_future_gmv
+            * assumption_profile["compensation_rate_on_prevented_gmv"]
+        )
+        avoided_reputation_cost = (
+            avoided_incremental_low_ratings
+            * assumption_profile["cost_per_incremental_low_rating_proxy_brl"]
+        )
+
+        avoided_harm_proxy = avoided_compensation_cost + avoided_reputation_cost
+
+        ops_cost = flagged_rows * ops_cost_per_flag
+        throttled_gmv = current_gmv_proxy * throttle_loss_rate
+        margin_loss = throttled_gmv * assumption_profile["margin_rate_on_gmv"]
+
+        total_cost = ops_cost + margin_loss
+        net_benefit = avoided_harm_proxy - total_cost
+        roi = net_benefit / total_cost if total_cost > 0 else np.nan
+
+        tier_rows.append(
+            {
+                "assumption_profile": assumption_profile_name,
+                "scenario_family": scenario_def["scenario_family"],
+                "scenario_name": scenario_def["scenario_name"],
+                "scenario_description": scenario_def["description"],
+                "tier_name": tier["tier_name"],
+                "action": action_name,
+                "start_frac": tier["start_frac"],
+                "end_frac": tier["end_frac"],
+                "flagged_rows": flagged_rows,
+                "flagged_share": flagged_rows / total_rows if total_rows > 0 else np.nan,
+                "unique_flagged_sellers": unique_flagged_sellers,
+                "flagged_seller_share": (
+                    unique_flagged_sellers / total_unique_sellers
+                    if total_unique_sellers and total_unique_sellers > 0 else np.nan
+                ),
+                "captured_future_events": captured_future_events,
+                "captured_future_gmv": captured_future_gmv,
+                "prevented_future_events": prevented_future_events,
+                "prevented_future_gmv": prevented_future_gmv,
+                "avoided_incremental_low_ratings": avoided_incremental_low_ratings,
+                "avoided_review_points": avoided_review_points,
+                "avoided_compensation_cost_proxy_brl": avoided_compensation_cost,
+                "avoided_reputation_cost_proxy_brl": avoided_reputation_cost,
+                "avoided_harm_proxy_brl": avoided_harm_proxy,
+                "ops_cost_brl": ops_cost,
+                "throttled_gmv_brl": throttled_gmv,
+                "margin_loss_brl": margin_loss,
+                "total_cost_brl": total_cost,
+                "net_benefit_brl": net_benefit,
+                "roi": roi,
+                "capture_rate_events": (
+                    captured_future_events / total_future_events if total_future_events > 0 else np.nan
+                ),
+                "capture_rate_gmv": (
+                    captured_future_gmv / total_future_gmv if total_future_gmv > 0 else np.nan
+                ),
+                "prevented_event_rate": (
+                    prevented_future_events / total_future_events if total_future_events > 0 else np.nan
+                ),
+                "prevented_gmv_rate": (
+                    prevented_future_gmv / total_future_gmv if total_future_gmv > 0 else np.nan
+                ),
+                "current_gmv_proxy_share": (
+                    current_gmv_proxy / total_current_gmv_proxy if total_current_gmv_proxy > 0 else np.nan
+                ),
+            }
+        )
+
+    tier_detail_df = pd.DataFrame(tier_rows)
+
+    if flagged_parts:
+        flagged_all = pd.concat(flagged_parts, ignore_index=True)
+    else:
+        flagged_all = pd.DataFrame(columns=scored_df.columns)
+
+    total_avoided_harm = tier_detail_df["avoided_harm_proxy_brl"].sum()
+    total_cost = tier_detail_df["total_cost_brl"].sum()
+    total_net_benefit = tier_detail_df["net_benefit_brl"].sum()
+
+    scenario_summary = {
+        "assumption_profile": assumption_profile_name,
+        "scenario_family": scenario_def["scenario_family"],
+        "scenario_name": scenario_def["scenario_name"],
+        "scenario_description": scenario_def["description"],
+        "flagged_rows": tier_detail_df["flagged_rows"].sum(),
+        "flagged_share": tier_detail_df["flagged_rows"].sum() / total_rows if total_rows > 0 else np.nan,
+        "unique_flagged_sellers": (
+            flagged_all["seller_id"].nunique() if "seller_id" in flagged_all.columns and len(flagged_all) > 0 else np.nan
+        ),
+        "flagged_seller_share": (
+            flagged_all["seller_id"].nunique() / total_unique_sellers
+            if "seller_id" in flagged_all.columns and total_unique_sellers and total_unique_sellers > 0 else np.nan
+        ),
+        "captured_future_events": tier_detail_df["captured_future_events"].sum(),
+        "captured_future_gmv": tier_detail_df["captured_future_gmv"].sum(),
+        "prevented_future_events": tier_detail_df["prevented_future_events"].sum(),
+        "prevented_future_gmv": tier_detail_df["prevented_future_gmv"].sum(),
+        "avoided_incremental_low_ratings": tier_detail_df["avoided_incremental_low_ratings"].sum(),
+        "avoided_review_points": tier_detail_df["avoided_review_points"].sum(),
+        "avoided_compensation_cost_proxy_brl": tier_detail_df["avoided_compensation_cost_proxy_brl"].sum(),
+        "avoided_reputation_cost_proxy_brl": tier_detail_df["avoided_reputation_cost_proxy_brl"].sum(),
+        "avoided_harm_proxy_brl": total_avoided_harm,
+        "ops_cost_brl": tier_detail_df["ops_cost_brl"].sum(),
+        "throttled_gmv_brl": tier_detail_df["throttled_gmv_brl"].sum(),
+        "margin_loss_brl": tier_detail_df["margin_loss_brl"].sum(),
+        "total_cost_brl": total_cost,
+        "net_benefit_brl": total_net_benefit,
+        "roi": total_net_benefit / total_cost if total_cost > 0 else np.nan,
+        "capture_rate_events": (
+            tier_detail_df["captured_future_events"].sum() / total_future_events
+            if total_future_events > 0 else np.nan
+        ),
+        "capture_rate_gmv": (
+            tier_detail_df["captured_future_gmv"].sum() / total_future_gmv
+            if total_future_gmv > 0 else np.nan
+        ),
+        "prevented_event_rate": (
+            tier_detail_df["prevented_future_events"].sum() / total_future_events
+            if total_future_events > 0 else np.nan
+        ),
+        "prevented_gmv_rate": (
+            tier_detail_df["prevented_future_gmv"].sum() / total_future_gmv
+            if total_future_gmv > 0 else np.nan
+        ),
+        "current_gmv_proxy_share": tier_detail_df["current_gmv_proxy_share"].sum(),
+        "baseline_total_future_events": baseline_row["total_future_events"],
+        "baseline_total_future_gmv_brl": baseline_row["total_future_gmv_brl"],
+        "baseline_incremental_low_ratings_proxy": baseline_row["incremental_low_ratings_proxy"],
+        "baseline_review_points_lost": baseline_row["review_points_lost"],
+        "baseline_total_harm_proxy_brl": baseline_row["total_harm_proxy_brl"],
+        "residual_harm_proxy_brl": baseline_row["total_harm_proxy_brl"] - total_avoided_harm,
+    }
+
+    scenario_summary_df = pd.DataFrame([scenario_summary])
+    return scenario_summary_df, tier_detail_df

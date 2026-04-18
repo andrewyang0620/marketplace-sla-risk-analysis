@@ -752,3 +752,47 @@ def simulate_ranked_scenario(
 
     scenario_summary_df = pd.DataFrame([scenario_summary])
     return scenario_summary_df, tier_detail_df
+
+
+def run_scenario_grid(
+    scored_df: pd.DataFrame,
+    score_col: str,
+    future_event_count_col: str,
+    future_event_gmv_col: str,
+    current_gmv_proxy_col: str,
+    severe_harm_row: Dict,
+    baseline_df: pd.DataFrame,
+    assumption_profiles: Dict[str, Dict],
+    scenario_library: List[Dict],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run all scenario x assumption combinations and return combined results.
+    """
+    summary_frames = []
+    tier_frames = []
+
+    for profile_name, profile in assumption_profiles.items():
+        baseline_row = baseline_df.loc[
+            baseline_df["assumption_profile"] == profile_name
+        ].iloc[0].to_dict()
+
+        for scenario_def in scenario_library:
+            summary_df, tier_df = simulate_ranked_scenario(
+                scored_df=scored_df,
+                score_col=score_col,
+                future_event_count_col=future_event_count_col,
+                future_event_gmv_col=future_event_gmv_col,
+                current_gmv_proxy_col=current_gmv_proxy_col,
+                severe_harm_row=severe_harm_row,
+                baseline_row=baseline_row,
+                assumption_profile_name=profile_name,
+                assumption_profile=profile,
+                scenario_def=scenario_def,
+            )
+            summary_frames.append(summary_df)
+            tier_frames.append(tier_df)
+
+    scenario_summary = pd.concat(summary_frames, ignore_index=True)
+    scenario_tiers = pd.concat(tier_frames, ignore_index=True)
+
+    return scenario_summary, scenario_tiers

@@ -239,18 +239,28 @@ def compute_no_intervention_baseline(
     severe_harm_row: Dict,
     assumption_profiles: Dict[str, Dict],
     current_gmv_proxy_col: str = "delivered_gmv_14d",
+    gmv_window_days: int = 14,
 ) -> pd.DataFrame:
     """
     Compute the explicit no-intervention baseline for each assumption profile.
 
     This formalises the benchmark that H4 scenarios are compared against.
 
-    Economic proxy design:
-      - Compensation cost proxy:
-          future severe-event GMV x compensation_rate_on_prevented_gmv
-      - Reputation cost proxy:
-          incremental low ratings x cost_per_incremental_low_rating_proxy_brl
-      - Review-score loss is kept as a non-monetised secondary KPI.
+    Economic proxy design
+    ---------------------
+    - Compensation cost proxy:
+        future severe-event GMV × compensation_rate_on_prevented_gmv
+    - Reputation cost proxy:
+        incremental low ratings × cost_per_incremental_low_rating_proxy_brl
+    - Review-score loss:
+        kept as a non-monetised secondary KPI
+
+    Important note on GMV proxy
+    ---------------------------
+    `current_gmv_proxy_col` is usually a rolling 14-day GMV proxy (e.g. delivered_gmv_14d).
+    To align it with seller-day decisions, the no-intervention baseline stores a
+    daily-aligned proxy:
+        current_gmv_proxy_brl = sum(current_gmv_proxy_col / gmv_window_days)
 
     Parameters
     ----------
@@ -264,25 +274,25 @@ def compute_no_intervention_baseline(
         Severe-harm coefficients from H2.
     assumption_profiles : dict
         Output of `build_assumption_profiles()`.
-    current_gmv_proxy_col : str, default "delivered_gmv_14d"
-        Current-period GMV exposure proxy.
+    current_gmv_proxy_col : str, default 'delivered_gmv_14d'
+        Current-period rolling GMV exposure proxy.
+    gmv_window_days : int, default 14
+        Number of days represented by the rolling GMV proxy.
 
     Returns
     -------
     pd.DataFrame
-        One row per assumption profile with:
-          - total_future_events
-          - total_future_gmv_brl
-          - incremental_low_ratings_proxy
-          - review_points_lost
-          - compensation_cost_proxy_brl
-          - reputation_cost_proxy_brl
-          - total_harm_proxy_brl
-          - current_gmv_proxy_brl
+        One row per assumption profile.
     """
     total_future_events = scored_df[future_event_count_col].sum()
     total_future_gmv = scored_df[future_event_gmv_col].sum()
-    total_current_gmv_proxy = scored_df[current_gmv_proxy_col].sum()
+
+    if current_gmv_proxy_col not in scored_df.columns:
+        raise ValueError(f"Missing column: {current_gmv_proxy_col}")
+
+    total_current_gmv_proxy = (
+        scored_df[current_gmv_proxy_col].fillna(0.0) / gmv_window_days
+    ).sum()
 
     incremental_low_ratings_proxy = (
         total_future_events * severe_harm_row["delta_low_rating"]
@@ -306,7 +316,8 @@ def compute_no_intervention_baseline(
             {
                 "assumption_profile": profile_name,
                 "seller_days": len(scored_df),
-                "unique_sellers": scored_df["seller_id"].nunique() if "seller_id" in scored_df.columns else np.nan,
+                "unique_sellers": scored_df["seller_id"].nunique()
+                if "seller_id" in scored_df.columns else np.nan,
                 "total_future_events": total_future_events,
                 "total_future_gmv_brl": total_future_gmv,
                 "incremental_low_ratings_proxy": incremental_low_ratings_proxy,
@@ -545,6 +556,100 @@ def _slice_rank_band(
     return ranked.iloc[start_idx:end_idx].copy()
 
 
+def _compute_action_exposure_and_ops_units(
+    band: pd.DataFrame,
+    action_name: str,
+    current_gmv_proxy_col: str,
+    gmv_window_days: int = 14,
+    seller_col: str = "seller_id",
+    throttle_duration_days: int = 1,
+) -> Tuple[float, int]:
+    """
+    Compute the action-level GMV exposure proxy and the operational unit count.
+
+    Why this helper exists
+    ----------------------
+    The early-warning panel is at the seller-day level, but not all interventions
+    should be costed at the seller-day level:
+
+    - For light-touch actions such as monitoring / support, seller-day costing is reasonable.
+    - For restrictive actions such as throttle, seller-day costing can severely overstate
+      business loss because:
+        1) the same seller may be flagged on many consecutive days;
+        2) `delivered_gmv_14d` is a rolling 14-day GMV proxy, so summing it across
+           consecutive seller-days creates overlap.
+
+    Design
+    ------
+    - For non-throttle actions:
+        exposure proxy = sum(current_gmv_proxy_col / gmv_window_days) across rows
+        ops units       = number of flagged seller-days
+    - For throttle:
+        exposure proxy = sum(max(current_gmv_proxy_col) / gmv_window_days) across unique sellers
+                         × throttle_duration_days
+        ops units       = number of unique flagged sellers
+
+    Important assumption
+    --------------------
+    For throttle, exposure is computed as a single-day GMV estimate by converting
+    the rolling GMV proxy into a daily proxy (e.g. delivered_gmv_14d / 14).
+    If the throttle decision is assumed to persist for N days, multiply the
+    exposure output by N or parameterise the duration explicitly via
+    `throttle_duration_days`.
+
+    Parameters
+    ----------
+    band : pd.DataFrame
+        Ranked subset for one scenario tier.
+    action_name : str
+        Intervention action name, e.g. 'monitor', 'standard_support',
+        'intensive_support', or 'throttle'.
+    current_gmv_proxy_col : str
+        Rolling GMV proxy column, e.g. 'delivered_gmv_14d'.
+    gmv_window_days : int, default 14
+        Number of days represented by the rolling GMV proxy.
+    seller_col : str, default 'seller_id'
+        Seller identifier column.
+    throttle_duration_days : int, default 1
+        Assumed number of days the throttle decision remains in effect.
+        Increasing this value scales up the throttle GMV exposure linearly.
+        Use for sensitivity analysis over {1, 3, 7} days.
+
+    Returns
+    -------
+    (current_gmv_proxy_brl, ops_units)
+        current_gmv_proxy_brl : float
+            Current exposure proxy in BRL, aligned to the action unit.
+        ops_units : int
+            Operational unit count used to compute intervention handling cost.
+    """
+    if band.empty:
+        return 0.0, 0
+
+    if current_gmv_proxy_col not in band.columns:
+        raise ValueError(f"Missing column: {current_gmv_proxy_col}")
+
+    if action_name == "throttle":
+        if seller_col in band.columns:
+            seller_level_proxy = (
+                band.groupby(seller_col)[current_gmv_proxy_col]
+                .max()
+                .fillna(0.0)
+            )
+            current_gmv_proxy_brl = (
+                (seller_level_proxy / gmv_window_days).sum() * throttle_duration_days
+            )
+            ops_units = seller_level_proxy.index.nunique()
+        else:
+            current_gmv_proxy_brl = (band[current_gmv_proxy_col].fillna(0.0) / gmv_window_days).sum()
+            ops_units = len(band)
+    else:
+        current_gmv_proxy_brl = (band[current_gmv_proxy_col].fillna(0.0) / gmv_window_days).sum()
+        ops_units = len(band)
+
+    return float(current_gmv_proxy_brl), int(ops_units)
+
+
 def simulate_ranked_scenario(
     scored_df: pd.DataFrame,
     score_col: str,
@@ -556,9 +661,67 @@ def simulate_ranked_scenario(
     assumption_profile_name: str,
     assumption_profile: Dict,
     scenario_def: Dict,
+    gmv_window_days: int = 14,
+    throttle_duration_days: int = 1,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Simulate one ROI scenario under one assumption profile.
+
+    Economic logic
+    --------------
+    - A flagged seller-day captures some future severe-event count and GMV.
+    - An intervention prevents a fraction of those harms (`efficacy`).
+    - Avoided compensation proxy is proportional to prevented severe-event GMV.
+    - Avoided reputation proxy is proportional to avoided incremental low ratings.
+    - Review-score points saved are reported as a secondary non-monetised KPI.
+    - Restrictive actions (throttle) reduce current GMV throughput and incur
+      a contribution-margin loss.
+    - Net benefit is defined relative to the explicit no-intervention baseline:
+        net benefit = avoided harm proxy - intervention cost
+
+    Important action-unit correction
+    --------------------------------
+    The panel is at seller-day level, but throttle is treated as a seller-level
+    restrictive action for costing purposes:
+    - throttle exposure uses unique-seller deduplicated GMV proxy
+    - throttle ops cost uses unique flagged sellers, not flagged seller-days
+
+    Parameters
+    ----------
+    scored_df : pd.DataFrame
+        Test/deployment window with risk scores and future-event columns.
+    score_col : str
+        Risk score column (e.g., score_lr_14d).
+    future_event_count_col : str
+        Count of future severe events in the chosen horizon.
+    future_event_gmv_col : str
+        GMV of future severe events in the chosen horizon.
+    current_gmv_proxy_col : str
+        Current rolling GMV exposure proxy (e.g., delivered_gmv_14d).
+    severe_harm_row : dict
+        Severe-harm coefficient row derived from H2.
+    baseline_row : dict
+        No-intervention baseline row for the same assumption profile.
+    assumption_profile_name : str
+        Name of the assumption profile.
+    assumption_profile : dict
+        One nested assumption profile from `build_assumption_profiles()`.
+    scenario_def : dict
+        One scenario definition from the scenario library.
+    gmv_window_days : int, default 14
+        Number of days represented by the rolling GMV proxy.
+    throttle_duration_days : int, default 1
+        Assumed number of days the throttle decision remains in effect.
+        Passed directly to `_compute_action_exposure_and_ops_units`.
+        Use 1 (default), 3, or 7 for sensitivity analysis.
+
+    Returns
+    -------
+    (scenario_summary_df, tier_detail_df)
+        scenario_summary_df : pd.DataFrame
+            Single-row scenario summary.
+        tier_detail_df : pd.DataFrame
+            One row per scenario tier, with detailed metrics.
     """
     required_cols = [
         score_col,
@@ -576,7 +739,6 @@ def simulate_ranked_scenario(
     )
     total_future_events = scored_df[future_event_count_col].sum()
     total_future_gmv = scored_df[future_event_gmv_col].sum()
-    total_current_gmv_proxy = scored_df[current_gmv_proxy_col].sum()
 
     tier_rows = []
     flagged_parts = []
@@ -604,7 +766,18 @@ def simulate_ranked_scenario(
 
         captured_future_events = band[future_event_count_col].sum()
         captured_future_gmv = band[future_event_gmv_col].sum()
-        current_gmv_proxy = band[current_gmv_proxy_col].sum()
+
+        # ------------------------------------------------------------------
+        # Action-aligned exposure proxy and ops units
+        # ------------------------------------------------------------------
+        current_gmv_proxy, ops_units = _compute_action_exposure_and_ops_units(
+            band=band,
+            action_name=action_name,
+            current_gmv_proxy_col=current_gmv_proxy_col,
+            gmv_window_days=gmv_window_days,
+            seller_col="seller_id",
+            throttle_duration_days=throttle_duration_days,
+        )
 
         prevented_future_events = efficacy * captured_future_events
         prevented_future_gmv = efficacy * captured_future_gmv
@@ -627,7 +800,10 @@ def simulate_ranked_scenario(
 
         avoided_harm_proxy = avoided_compensation_cost + avoided_reputation_cost
 
-        ops_cost = flagged_rows * ops_cost_per_flag
+        # ------------------------------------------------------------------
+        # Cost side
+        # ------------------------------------------------------------------
+        ops_cost = ops_units * ops_cost_per_flag
         throttled_gmv = current_gmv_proxy * throttle_loss_rate
         margin_loss = throttled_gmv * assumption_profile["margin_rate_on_gmv"]
 
@@ -652,6 +828,7 @@ def simulate_ranked_scenario(
                     unique_flagged_sellers / total_unique_sellers
                     if total_unique_sellers and total_unique_sellers > 0 else np.nan
                 ),
+                "ops_units": ops_units,
                 "captured_future_events": captured_future_events,
                 "captured_future_gmv": captured_future_gmv,
                 "prevented_future_events": prevented_future_events,
@@ -661,6 +838,7 @@ def simulate_ranked_scenario(
                 "avoided_compensation_cost_proxy_brl": avoided_compensation_cost,
                 "avoided_reputation_cost_proxy_brl": avoided_reputation_cost,
                 "avoided_harm_proxy_brl": avoided_harm_proxy,
+                "current_gmv_proxy_brl": current_gmv_proxy,
                 "ops_cost_brl": ops_cost,
                 "throttled_gmv_brl": throttled_gmv,
                 "margin_loss_brl": margin_loss,
@@ -680,7 +858,8 @@ def simulate_ranked_scenario(
                     prevented_future_gmv / total_future_gmv if total_future_gmv > 0 else np.nan
                 ),
                 "current_gmv_proxy_share": (
-                    current_gmv_proxy / total_current_gmv_proxy if total_current_gmv_proxy > 0 else np.nan
+                    current_gmv_proxy / baseline_row["current_gmv_proxy_brl"]
+                    if baseline_row["current_gmv_proxy_brl"] > 0 else np.nan
                 ),
             }
         )
@@ -704,12 +883,14 @@ def simulate_ranked_scenario(
         "flagged_rows": tier_detail_df["flagged_rows"].sum(),
         "flagged_share": tier_detail_df["flagged_rows"].sum() / total_rows if total_rows > 0 else np.nan,
         "unique_flagged_sellers": (
-            flagged_all["seller_id"].nunique() if "seller_id" in flagged_all.columns and len(flagged_all) > 0 else np.nan
+            flagged_all["seller_id"].nunique()
+            if "seller_id" in flagged_all.columns and len(flagged_all) > 0 else np.nan
         ),
         "flagged_seller_share": (
             flagged_all["seller_id"].nunique() / total_unique_sellers
             if "seller_id" in flagged_all.columns and total_unique_sellers and total_unique_sellers > 0 else np.nan
         ),
+        "ops_units": tier_detail_df["ops_units"].sum(),
         "captured_future_events": tier_detail_df["captured_future_events"].sum(),
         "captured_future_gmv": tier_detail_df["captured_future_gmv"].sum(),
         "prevented_future_events": tier_detail_df["prevented_future_events"].sum(),
@@ -719,6 +900,7 @@ def simulate_ranked_scenario(
         "avoided_compensation_cost_proxy_brl": tier_detail_df["avoided_compensation_cost_proxy_brl"].sum(),
         "avoided_reputation_cost_proxy_brl": tier_detail_df["avoided_reputation_cost_proxy_brl"].sum(),
         "avoided_harm_proxy_brl": total_avoided_harm,
+        "current_gmv_proxy_brl": tier_detail_df["current_gmv_proxy_brl"].sum(),
         "ops_cost_brl": tier_detail_df["ops_cost_brl"].sum(),
         "throttled_gmv_brl": tier_detail_df["throttled_gmv_brl"].sum(),
         "margin_loss_brl": tier_detail_df["margin_loss_brl"].sum(),
@@ -741,7 +923,10 @@ def simulate_ranked_scenario(
             tier_detail_df["prevented_future_gmv"].sum() / total_future_gmv
             if total_future_gmv > 0 else np.nan
         ),
-        "current_gmv_proxy_share": tier_detail_df["current_gmv_proxy_share"].sum(),
+        "current_gmv_proxy_share": (
+            tier_detail_df["current_gmv_proxy_brl"].sum() / baseline_row["current_gmv_proxy_brl"]
+            if baseline_row["current_gmv_proxy_brl"] > 0 else np.nan
+        ),
         "baseline_total_future_events": baseline_row["total_future_events"],
         "baseline_total_future_gmv_brl": baseline_row["total_future_gmv_brl"],
         "baseline_incremental_low_ratings_proxy": baseline_row["incremental_low_ratings_proxy"],
@@ -753,7 +938,6 @@ def simulate_ranked_scenario(
     scenario_summary_df = pd.DataFrame([scenario_summary])
     return scenario_summary_df, tier_detail_df
 
-
 def run_scenario_grid(
     scored_df: pd.DataFrame,
     score_col: str,
@@ -764,6 +948,8 @@ def run_scenario_grid(
     baseline_df: pd.DataFrame,
     assumption_profiles: Dict[str, Dict],
     scenario_library: List[Dict],
+    gmv_window_days: int = 14,
+    throttle_duration_days: int = 1,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run all scenario x assumption combinations and return combined results.
@@ -788,6 +974,8 @@ def run_scenario_grid(
                 assumption_profile_name=profile_name,
                 assumption_profile=profile,
                 scenario_def=scenario_def,
+                gmv_window_days=gmv_window_days,
+                throttle_duration_days=throttle_duration_days,
             )
             summary_frames.append(summary_df)
             tier_frames.append(tier_df)

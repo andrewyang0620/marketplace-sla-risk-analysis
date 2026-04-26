@@ -108,6 +108,7 @@
   - **GMV proxy**: `delivered_gmv_14d` is a 14-day rolling delivered GMV, not exact realised forward revenue; actual business impact may differ.
   - **No causal identification**: the simulation quantifies correlation-based opportunity, not counterfactual intervention gain. A randomised experiment would be required to establish the true causal effect of throttle on future severe-event rates.
   - **Single throttle duration**: the base simulation assumes a 1-day throttle decision. Extending to 3–7 days is supported via the `throttle_duration_days` parameter but is not explored in the default scenario grid.
+  - **Dataset scale**: Olist contains 3,095 total sellers across 2016–2018; top 1% of seller-days deduplicates to 9 unique targets. Absolute BRL figures are illustrative at this scale, not operationally significant. The framework scales linearly: a marketplace with 30,000 sellers would flag ~90 sellers per cycle with proportionally larger avoided harm and the same ROI structure.
 
 - **Artifacts saved for downstream analysis**
   - `h4_baseline_no_intervention.parquet`: No-intervention benchmark across all 3 assumption profiles.
